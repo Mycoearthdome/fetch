@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use futures_util::StreamExt;
+use tokio;
+use tokio::time::{sleep, Duration};
 
 #[derive(Serialize)]
 struct Prompt {
@@ -14,7 +16,6 @@ struct Prompt {
 struct ResponseChunk {
     response: String,
     done: bool,
-    // Add more fields if needed
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,7 +24,6 @@ struct StructuredInsight {
     concept: Option<String>,
     definition: Option<String>,
     example: Option<String>,
-    subtopic: Option<String>,
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -31,7 +31,6 @@ struct Concept {
     definition: Option<String>,
     examples: HashSet<String>,
     related_concepts: HashSet<String>,
-    subtopics: HashSet<String>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -45,23 +44,23 @@ impl Knowledge {
     }
 
     fn add_related_concept(&mut self, concept: &str, related: String) {
-        let concept_entry = self.concepts.entry(concept.to_string()).or_default();
-        concept_entry.related_concepts.insert(related);
+        self.concepts
+            .entry(concept.to_string())
+            .or_default()
+            .related_concepts
+            .insert(related);
     }
 
     fn add_definition(&mut self, concept: String, definition: String) {
-        let concept_entry = self.concepts.entry(concept).or_default();
-        concept_entry.definition = Some(definition);
+        self.concepts.entry(concept).or_default().definition = Some(definition);
     }
 
     fn add_example(&mut self, concept: &str, example: String) {
-        let concept_entry = self.concepts.entry(concept.to_string()).or_default();
-        concept_entry.examples.insert(example);
-    }
-
-    fn add_subtopic(&mut self, concept: &str, subtopic: String) {
-        let concept_entry = self.concepts.entry(concept.to_string()).or_default();
-        concept_entry.subtopics.insert(subtopic);
+        self.concepts
+            .entry(concept.to_string())
+            .or_default()
+            .examples
+            .insert(example);
     }
 }
 
@@ -78,12 +77,14 @@ async fn main() -> Result<(), reqwest::Error> {
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Failed to read line");
 
-    let prompt_text = format!("How does {} relate to other fields of science?", input.trim());
+    let prompt_text = format!(
+        "How does {} relate to other fields of science?",
+        input.trim()
+    );
 
     let mut knowledge = Knowledge::default();
 
     build_documentation(&mut knowledge, &client, prompt_text).await?;
-
     write_documentation_to_file(&knowledge);
 
     Ok(())
@@ -92,7 +93,6 @@ async fn main() -> Result<(), reqwest::Error> {
 async fn get_streamed_text(response: reqwest::Response) -> Result<String, reqwest::Error> {
     let mut full_text = String::new();
     let mut buffer = String::new();
-
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -101,8 +101,8 @@ async fn get_streamed_text(response: reqwest::Response) -> Result<String, reqwes
         buffer.push_str(&text);
 
         while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim().to_string(); // clone to avoid borrow issue
-            buffer = buffer[pos + 1..].to_string();      // now safe to mutate
+            let line = buffer[..pos].trim().to_string();
+            buffer = buffer[pos + 1..].to_string();
 
             if line.is_empty() {
                 continue;
@@ -125,7 +125,6 @@ async fn get_streamed_text(response: reqwest::Response) -> Result<String, reqwes
     Ok(full_text)
 }
 
-
 async fn build_documentation(
     knowledge: &mut Knowledge,
     client: &Client,
@@ -133,6 +132,7 @@ async fn build_documentation(
 ) -> Result<(), reqwest::Error> {
     knowledge.add_concept("General".to_string());
 
+    // Start with the initial prompt
     let prompt = Prompt {
         model: MODEL.to_string(),
         prompt: initial_prompt.clone(),
@@ -145,37 +145,41 @@ async fn build_documentation(
         .await?;
 
     let text = get_streamed_text(response).await?;
-    println!("Summary: {}", text);
+    println!("Initial Summary: {}", text);
 
     extract_insights(&text, knowledge, client).await?;
 
-    let mut previous_concepts = knowledge.concepts.clone();
-    let mut depth = 1;
-    loop {
-        if depth == 0{
-            break
-        }
-        let general_subtopics = knowledge
-            .concepts
-            .get("General")
-            .map(|c| c.subtopics.clone())
-            .unwrap_or_default();
+    // Recursive exploration
+    let mut explored: HashSet<String> = HashSet::new();
+    let mut to_explore: Vec<String> = knowledge
+    .concepts
+    .keys()
+    .filter(|c| *c != "General") // Skip "General"
+    .cloned()
+    .collect();
 
-        if general_subtopics.is_empty() {
-            println!("No more subtopics to explore.");
-            break;
+    while let Some(concept) = to_explore.pop() {
+        if explored.contains(&concept) {
+            continue;
         }
 
-        let subtopic_str = general_subtopics.iter().cloned().collect::<Vec<_>>().join(", ");
+        explored.insert(concept.clone());
 
-        let prompt_str = format!(
-            "Please provide detailed explanations of the following subtopics: {}. Describe how each relates to {}.",
-            subtopic_str, initial_prompt
+        let knowledge_depth = to_explore.len();
+
+        println!("30 seconds CoolDown starts...");
+        sleep(Duration::from_secs(30)).await;
+        println!("Remaining concepts to explore: {}", knowledge_depth);
+        println!("Exploring related concept: {}", concept);
+
+        let prompt_text = format!(
+            "In the context of {}, how does the concept '{}' relate to other scientific disciplines or subfields? List related concepts, define them, and provide examples.",
+            initial_prompt, concept
         );
 
         let prompt = Prompt {
             model: MODEL.to_string(),
-            prompt: prompt_str,
+            prompt: prompt_text,
         };
 
         let response = client
@@ -185,22 +189,22 @@ async fn build_documentation(
             .await?;
 
         let text = get_streamed_text(response).await?;
-        println!("Summary: {}", text);
+        println!("Summary for '{}': {}", concept, text);
 
         extract_insights(&text, knowledge, client).await?;
 
-        if previous_concepts == knowledge.concepts {
-            println!("No new concepts found, stopping.");
-            break;
+        if let Some(concept_entry) = knowledge.concepts.get(&concept) {
+            for related in &concept_entry.related_concepts {
+                if !explored.contains(related) && !to_explore.contains(related) {
+                    to_explore.push(related.clone());
+                }
+            }
         }
-
-        previous_concepts = knowledge.concepts.clone();
-
-        depth -= 1; //temporary DEBUG
     }
 
     Ok(())
 }
+
 
 fn extract_json_block(text: &str) -> Option<String> {
     let start = text.find('[')?;
@@ -214,10 +218,10 @@ async fn extract_insights(
     client: &Client,
 ) -> Result<(), reqwest::Error> {
     let prompt = format!(
-        "Analyze the following text and return JSON with these fields: topic, concept, definition, example, subtopic.\n\
+        "Analyze the following text and return JSON with these fields: topic, concept, definition, example.\n\
         Example JSON format:\n\
-        {{ \"topic\": \"Physics\", \"concept\": \"Gravity\", \"definition\": \"A force...\", \"example\": \"An apple falling...\", \"subtopic\": \"Newton's Laws\" }}\n\n\
-        Test: \"{}\"",
+        {{ \"topic\": \"Physics\", \"concept\": \"Gravity\", \"definition\": \"A force...\", \"example\": \"An apple falling...\" }}\n\n\
+        Text: \"{}\"",
         text
     );
 
@@ -235,10 +239,8 @@ async fn extract_insights(
     let raw_text = get_streamed_text(response).await?;
     println!("Raw model output:\n{}", raw_text);
 
-    // Try parsing the model's response as JSON
-
     match extract_json_block(&raw_text)
-    .and_then(|json| serde_json::from_str::<Vec<StructuredInsight>>(&json).ok())
+        .and_then(|json| serde_json::from_str::<Vec<StructuredInsight>>(&json).ok())
     {
         Some(insights) => {
             for insight in insights {
@@ -247,6 +249,7 @@ async fn extract_insights(
 
                     if let Some(topic) = &insight.topic {
                         knowledge.add_related_concept(concept, topic.clone());
+                        knowledge.add_related_concept(topic, concept.clone()); // Add reverse link
                     }
 
                     if let Some(def) = &insight.definition {
@@ -255,12 +258,6 @@ async fn extract_insights(
 
                     if let Some(ex) = &insight.example {
                         knowledge.add_example(concept, ex.clone());
-                    }
-                }
-
-                if let Some(sub) = &insight.subtopic {
-                    if !sub.is_empty() {
-                        knowledge.add_subtopic("General", sub.clone());
                     }
                 }
             }
@@ -295,13 +292,6 @@ fn write_documentation_to_file(knowledge: &Knowledge) {
             writeln!(file, "  Related Concepts:").unwrap();
             for rc in &details.related_concepts {
                 writeln!(file, "    - {}", rc).unwrap();
-            }
-        }
-
-        if !details.subtopics.is_empty() {
-            writeln!(file, "  Subtopics:").unwrap();
-            for st in &details.subtopics {
-                writeln!(file, "    - {}", st).unwrap();
             }
         }
 
